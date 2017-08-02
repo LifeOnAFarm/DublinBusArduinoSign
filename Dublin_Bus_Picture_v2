@@ -1,0 +1,265 @@
+/****************************
+Name:         Seamus de Cleir
+Date:         03/04/2017
+Description:  This program uses the ESP2866 and MAX2719 to display when the next bus is 
+              due to arrive at a given spot. WifiManager is used to input the bus Number
+              and Bus Stop.
+License:      MIT License
+Credit:       tzapu, krzychb
+******************************/
+//To Do: HTML nicer. Reset button
+
+#include <FS.h>
+
+#include <ESP8266WiFi.h>
+#include <WiFiManager.h> 
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <WiFiClientSecure.h>
+
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include "LedControl.h"
+
+//Dublin Bus website
+#define DUBLIN_BUS "dublinked.ie"
+
+// GPIO pins used mapped for the NodeMCU ESP8266 version 2
+LedControl lc=LedControl(D8,D7,D6,1);
+
+char busStop[40] = "1495";
+char busNumber[40] = "123";
+
+
+void setup()
+{
+  // Outputs serial to 115200 for debugging
+  Serial.begin(115200);
+
+  // Reads from FS json file
+  if (SPIFFS.begin()) {
+    
+    if (SPIFFS.exists("/config.json")) {
+      // If it already exists then the file is read
+      File configFile = SPIFFS.open("/config.json", "r");
+      
+      if (configFile) {
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBufferFS;
+        JsonObject& jsonFS = jsonBufferFS.parseObject(buf.get());
+        jsonFS.printTo(Serial);
+
+        // Check if the file parsed correctly and copies values
+        if (jsonFS.success()) {
+          Serial.println("\nparsed json");
+          strcpy(busStop, jsonFS["busStop"]);
+          strcpy(busNumber, jsonFS["busNumber"]);
+        } else {
+          Serial.println("Failed to load json config");
+        }
+      }
+    }
+  } else {
+    Serial.println("Failed to mount FS");
+  }
+
+  // These edit the HTML Form on the AP to collect values for the bus stop and bus number
+  WiFiManagerParameter customBusStop("stopNo", "Bus Stop Number", busStop, 40);
+  WiFiManagerParameter customBusNumber("busNo", "Bus Number", busNumber, 40);
+
+  // Initialize the MAX7219 device
+  lc.shutdown(0,false);   // Enable display
+  lc.setIntensity(0,15);  // Set brightness level (0 is min, 15 is max)
+  lc.clearDisplay(0);     // Clear display register
+  
+  WiFiManager wifiManager;
+
+  // Value Parametres 
+  wifiManager.addParameter(&customBusStop);
+  wifiManager.addParameter(&customBusNumber);
+
+  // Starts wifiManager and attempts to connect using previous details
+  // If it can't, an AP is started to input details
+  if (!wifiManager.autoConnect("BusPictureAP", "DublinBus")) {
+    Serial.println("failed to connect and hit timeout");
+    delay(2000);
+    // Reset in 10 seconds and try again
+    ESP.reset();
+    delay(10000);
+  }
+
+  // Reads the updated parameters
+  strcpy(busStop, customBusStop.getValue());
+  strcpy(busNumber, customBusNumber.getValue());
+
+  // Save the custom parameters to FS json files
+  if (true) {
+    DynamicJsonBuffer jsonBufferFS;
+    JsonObject& jsonFS = jsonBufferFS.createObject();
+    jsonFS["busStop"] = busStop;
+    jsonFS["busNumber"] = busNumber;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("Failed to open config file for writing");
+    }
+
+    jsonFS.printTo(Serial);
+    jsonFS.printTo(configFile);
+    configFile.close();
+  }
+
+  // Prints if the connection is successful
+  Serial.println();
+  Serial.println(F("WiFi connected"));
+  Serial.println(F("IP address: "));
+  Serial.println(WiFi.localIP());
+}
+
+// Used to store the JSON file from Dublin Bus
+static char jsonBuf[4096];
+
+// showBusTimes function
+bool showBusTimes(char *json);
+
+void loop()
+{
+  // Connect through port 443
+  const int httpsPort = 443;
+  const char* fingerprint = "CF 05 98 89 CA FF 8E D8 5E 5C E0 C2 E4 F7 E6 C3 C7 50 DD 5C";
+  
+  
+  // Use WiFiClientSecure class to create TLS connection
+  WiFiClientSecure httpclient;
+  Serial.print("connecting to ");
+  Serial.println(DUBLIN_BUS);
+  if (!httpclient.connect(DUBLIN_BUS, httpsPort)) {
+    Serial.println("connection failed");
+    return;
+  }
+
+  // Covert to Strings to make it easier
+  String strBusStop =  String(busStop); 
+  String strBusNumber =  String(busNumber); 
+  
+  String url = "/cgi-bin/rtpi/realtimebusinformation?stopid=" + strBusStop + "&routid=" + strBusNumber + "&maxresults=3&format=json";
+  
+  Serial.print("requesting URL: ");
+  Serial.println(url);
+
+  httpclient.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + DUBLIN_BUS + "\r\n" +
+               "User-Agent: BuildFailureDetectorESP8266\r\n" +
+               "Connection: close\r\n\r\n");
+
+  Serial.println("request sent");
+  // Collect http response headers and content from Dublinked
+  // HTTP headers are discarded.
+  // The content is formatted in JSON and is left in jsonBuf.
+  int jsonLen = 0;
+  bool skip_headers = true;
+  while (httpclient.connected() || httpclient.available()) {
+    if (skip_headers) {
+      String aLine = httpclient.readStringUntil('\n');
+      //Serial.println(aLine);
+      // Blank line denotes end of headers
+      if (aLine.length() <= 1) {
+        skip_headers = false;
+      }
+    }
+    else {
+      int bytesIn;
+      bytesIn = httpclient.read((uint8_t *)&jsonBuf[jsonLen], sizeof(jsonBuf) - jsonLen);
+      Serial.print(F("bytesIn ")); Serial.println(bytesIn);
+      if (bytesIn > 0) {
+        jsonLen += bytesIn;
+        if (jsonLen > sizeof(jsonBuf)) jsonLen = sizeof(jsonBuf);
+      }
+      else if (bytesIn < 0) {
+        Serial.print(F("read error "));
+        Serial.println(bytesIn);
+      }
+    }
+    delay(1);
+  }
+  httpclient.stop();
+  
+  // Switches the LED screen on
+  lc.shutdown(0, false);
+  
+  // Starts the showBusTimes function
+  showBusTimes(jsonBuf);
+
+  // Leaves the LED screen on for 10 seconds and then turns off
+  // Puts the ESP2866 into deep sleep
+  delay(10000);
+  lc.shutdown(0, true);
+  ESP.deepSleep(0);
+}
+
+bool showBusTimes(char *json)
+{
+  StaticJsonBuffer<3*1024> jsonBuffer;
+
+  // Skip characters until first '{' found
+  char *jsonStart = strchr(json, '{');
+  
+  // Checks to see if jsonStart is empty
+  if (jsonStart == NULL) {
+    Serial.println(F("JSON data missing"));
+    return false;
+  }
+  
+  json = jsonStart;
+
+  // Parse json file
+  JsonObject& root = jsonBuffer.parseObject(json);
+
+  // Throws an error if json is not properly parsed
+  if (!root.success()) {
+    Serial.println(F("jsonBuffer.parseObject() failed"));
+    return false;
+  }
+
+  // Saves the json's errorcode
+  int errorcode = (int)root["errorcode"];
+  
+  // Checks if the errorcode is greater than 0 which means theres a problem
+  if (errorcode > 0){
+    Serial.println("Errorcode is greater than 0");
+    Serial.println(errorcode);
+
+    // If there's no next bus then dashs are shown
+    for(int i = 0;i < 8; i++) {
+      lc.setChar(0, i, '-', false);
+    }
+    delay(10000);
+    return false; 
+  }
+  
+  // Extract duetimes and routes from the json file
+  String duetime = root["results"][0]["duetime"];
+  String route = root["results"][0]["route"];
+  
+  
+  // Prints the route to the LED screen
+  for(int i = 0;i < route.length(); i++) {
+    lc.setChar(0, 7-i, route[i], false);
+  }
+
+  // Prints 0 if the "due" is returned
+  if(duetime == "Due"){
+    lc.setDigit(0, 0, 0, false);
+  }else{
+    // Prints the Duetime to the LED screen
+    for(int i = 0;i < duetime.length(); i++) {
+      lc.setChar(0, i, duetime[duetime.length()-1-i], false);
+    }
+  }
+
+
+  return true;
+}
