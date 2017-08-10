@@ -7,7 +7,7 @@ Description:  This program uses the ESP2866 and MAX2719 to display when the next
 License:      MIT License
 Credit:       tzapu, krzychb
 ******************************/
-//To Do: HTML nicer. Reset button
+//To Do: HTML nicer
 
 #include <FS.h>
 
@@ -27,6 +27,7 @@ Credit:       tzapu, krzychb
 // GPIO pins used mapped for the NodeMCU ESP8266 version 2
 LedControl lc=LedControl(D8,D7,D6,1);
 
+
 char busStop[40] = "1495";
 char busNumber[40] = "123";
 
@@ -36,6 +37,16 @@ void setup()
   // Outputs serial to 115200 for debugging
   Serial.begin(115200);
 
+  // Reset switch. Set pin 5/D1 as an input
+  pinMode(5, INPUT);
+
+  // Resests the WIFI details if the reset switch is held
+  if (digitalRead(5) == HIGH) {
+    WiFi.disconnect(); 
+    Serial.print("Reset pin pressed");
+  }
+  
+  
   // Reads from FS json file
   if (SPIFFS.begin()) {
     
@@ -121,6 +132,7 @@ void setup()
 
 // Used to store the JSON file from Dublin Bus
 static char jsonBuf[4096];
+static char jsonBuf2[4096];
 
 // showBusTimes function
 bool showBusTimes(char *json);
@@ -200,6 +212,7 @@ void loop()
   ESP.deepSleep(0);
 }
 
+/// showBusTimes Function
 bool showBusTimes(char *json)
 {
   StaticJsonBuffer<3*1024> jsonBuffer;
